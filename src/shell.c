@@ -184,8 +184,10 @@ struct shell_surface {
 	enum shell_surface_type type, next_type, saved_type;
 	char *title, *class;
 	int32_t saved_x, saved_y;
+	float saved_unsnap_x, saved_unsnap_y;
 	bool saved_position_valid;
 	bool saved_rotation_valid;
+	bool unsnap_maximize_active;
 	int minimized;
 	int unresponsive;
 
@@ -1023,16 +1025,47 @@ move_grab_motion(struct wl_pointer_grab *grab,
 	struct wl_pointer *pointer = grab->pointer;
 	struct shell_surface *shsurf = move->base.shsurf;
 	struct weston_surface *es;
-	int dx = wl_fixed_to_int(pointer->x + move->dx);
-	int dy = wl_fixed_to_int(pointer->y + move->dy);
+	int pointer_dx;
+	int pointer_dy;
+	double distance;
+	int dx;
+	int dy;
 
 	if (!shsurf)
 		return;
 
 	es = shsurf->surface;
 
-	weston_surface_configure(es, dx, dy,
-				 es->geometry.width, es->geometry.height);
+	if (shsurf->type == SHELL_SURFACE_MAXIMIZED) {
+		pointer_dx = wl_fixed_to_int(pointer->grab_x - pointer->x);
+		pointer_dy = wl_fixed_to_int(pointer->grab_y - pointer->y);
+		distance = sqrt(pointer_dx * pointer_dx + pointer_dy * pointer_dy);
+
+		/* If pointer travels enough distance, we unsnap the surface
+		 * from maximized state */
+		if (distance >= 24.0) {
+			shsurf->unsnap_maximize_active = true;
+			fprintf(stderr, "sending unmaximize event\n");
+			shsurf->client->send_unmaximize(shsurf->surface);
+		}
+	} else {
+		if (shsurf->unsnap_maximize_active &&
+			shsurf->type == SHELL_SURFACE_TOPLEVEL) {
+
+			move->dx = wl_fixed_from_double(es->geometry.x -
+											shsurf->saved_unsnap_x);
+			move->dy = wl_fixed_from_double(es->geometry.y -
+											shsurf->saved_unsnap_y);
+
+			shsurf->unsnap_maximize_active = false;
+		} else {
+			dx = wl_fixed_to_int(pointer->x + move->dx);
+			dy = wl_fixed_to_int(pointer->y + move->dy);
+
+			weston_surface_configure(es, dx, dy,
+					es->geometry.width, es->geometry.height);
+		}
+	}
 
 	weston_compositor_schedule_repaint(es->compositor);
 }
@@ -1044,6 +1077,7 @@ move_grab_button(struct wl_pointer_grab *grab,
 	struct shell_grab *shell_grab = container_of(grab, struct shell_grab,
 						    grab);
 	struct wl_pointer *pointer = grab->pointer;
+	struct shell_surface *shsurf = shell_grab->shsurf;
 	enum wl_pointer_button_state state = state_w;
 
 	if (pointer->button_count == 0 &&
@@ -1869,9 +1903,11 @@ shell_unset_maximized(struct shell_surface *shsurf)
 	struct workspace *ws;
 	/* undo all maximized things here */
 	shsurf->output = get_default_output(shsurf->surface->compositor);
-	weston_surface_set_position(shsurf->surface,
-				    shsurf->saved_x,
-				    shsurf->saved_y);
+	if (shsurf->saved_position_valid) {
+		weston_surface_set_position(shsurf->surface,
+						shsurf->saved_x,
+						shsurf->saved_y);
+	}
 	if (shsurf->saved_rotation_valid) {
 		wl_list_insert(&shsurf->surface->geometry.transformation_list,
 						   &shsurf->rotation.transform.link);
@@ -2568,6 +2604,7 @@ create_shell_surface(void *shell, struct weston_surface *surface,
 	shsurf->unresponsive = 0;
 	shsurf->saved_position_valid = false;
 	shsurf->saved_rotation_valid = false;
+	shsurf->unsnap_maximize_active = false;
 	shsurf->surface = surface;
 	shsurf->fullscreen.type = WL_SHELL_SURFACE_FULLSCREEN_METHOD_DEFAULT;
 	shsurf->fullscreen.framerate = 0;
@@ -2953,8 +2990,7 @@ move_binding(struct wl_seat *seat, uint32_t time, uint32_t button, void *data)
 		return;
 
 	shsurf = get_shell_surface(surface);
-	if (shsurf == NULL || shsurf->type == SHELL_SURFACE_FULLSCREEN ||
-	    shsurf->type == SHELL_SURFACE_MAXIMIZED)
+	if (shsurf == NULL || shsurf->type == SHELL_SURFACE_FULLSCREEN)
 		return;
 
 	surface_move(shsurf, (struct weston_seat *) seat);
@@ -3751,6 +3787,9 @@ shell_surface_configure(struct weston_surface *es, int32_t sx, int32_t sy, int32
 {
 	struct shell_surface *shsurf = get_shell_surface(es);
 	struct desktop_shell *shell = shsurf->shell;
+	struct weston_seat *seat = NULL;
+
+	fprintf(stderr, "i received shell_surface_configure with width/height %d %d\n", width, height);
 
 	int type_changed = 0;
 
@@ -3758,6 +3797,28 @@ shell_surface_configure(struct weston_surface *es, int32_t sx, int32_t sy, int32
 	 * grab it. */
 	if (!weston_surface_is_mapped(es) && shsurf->popup.grab.pointer) {
 		grab_parent_popup(shsurf);
+	}
+
+	/* If there is active move grab, and we are about to change surface type
+	 * from maximized to toplevel state, it's time to adjust its position */
+	if (shsurf->unsnap_maximize_active && shsurf->client == &shell_client &&
+		shsurf->type == SHELL_SURFACE_MAXIMIZED &&
+		shsurf->next_type == SHELL_SURFACE_TOPLEVEL) {
+
+		wl_list_for_each(seat, &shsurf->surface->compositor->seat_list, link) {
+			if (seat->has_pointer) {
+				shsurf->saved_unsnap_x = wl_fixed_to_double(seat->pointer.x);
+				shsurf->saved_unsnap_y = wl_fixed_to_double(seat->pointer.y);
+
+				weston_surface_set_position(shsurf->surface,
+						wl_fixed_to_double(seat->pointer.x) - (width / 2),
+						wl_fixed_to_double(seat->pointer.y) - 45);
+
+				shsurf->saved_position_valid = false;
+
+				break;
+			}
+		}
 	}
 
 	if (width == 0)
